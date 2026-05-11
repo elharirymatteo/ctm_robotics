@@ -1,7 +1,7 @@
 # CTM as Interpretable Implicit World Model for PO Robot Control
 
-**Date:** 2026-05-09
-**Status:** Approved for implementation
+**Date:** 2026-05-09 (updated 2026-05-11)
+**Status:** Approved for implementation — environments confirmed by experiment
 
 ---
 
@@ -27,10 +27,12 @@ Two tasks, each with full-obs and PO variants:
 
 | Task | Full obs | PO variant | Masked dims | Why |
 |---|---|---|---|---|
-| CartPole | CartPole-v1 | CartPole-PO-v1 | cart_vel (1), pole_angvel (3) | Existing CTM result (46 > LSTM 27); established benchmark |
-| Acrobot | Acrobot-v1 | Acrobot-PO-v1 | dtheta1 (4), dtheta2 (5) | Reactive MLP fails without velocity; Sakana tested it; longer episodes (up to 500 steps) |
+| CartPole | CartPole-v1 | CartPole-PO-v1 | cart_vel (1), pole_angvel (3) | Confirmed: CTM 46 ± 16 > LSTM 27 ± 1; clean memory requirement |
+| LunarLander | LunarLander-v3 | LunarLander-PO-v3 | vx (2), vy (3), ang_vel (5) | Confirmed: CTM -115.5 ± 9 > LSTM -161.3 ± 8; all 3 CTM seeds learn; richer 8-dim obs |
 
-**PO design rationale:** masking velocities forces temporal integration — an agent must differentiate position/angle signals over time to infer velocity. Reactive MLP control degrades significantly (unlike CartPole-PO-v2 where derivative control was sufficient). The hidden variables are physically meaningful, enabling interpretability analysis.
+**Acrobot-PO rejected (2026-05-11):** Acrobot's -1/step sparse reward creates near-zero advantage variance at training start. All early episodes hit the 500-step timeout → normalized advantages collapse → neither LSTM nor CTM can escape. MLP escapes via local correlations; recurrent policies cannot. Replaced with LunarLander-PO which has dense shaped reward.
+
+**PO design rationale:** masking velocities forces temporal integration — an agent must differentiate position/angle signals over time to infer velocity. The hidden variables are physically meaningful (linear and angular velocity), enabling interpretability analysis. Note: MLP reactive control remains competitive on both PO envs due to shaped rewards; the CTM > LSTM comparison is the key claim, not CTM > MLP.
 
 ---
 
@@ -47,7 +49,8 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 **Training config:**
 - 3 seeds (42, 123, 456), 300k steps each
 - CTM: lr=5e-4, n_steps=512, recurrent_seq_len=100, n_epochs=1, clip=0.1, vf_coef=0.25, ent_coef=0.1→0.005
-- LSTM/MLP: standard PPO defaults (n_steps=512, n_epochs=4, lr=3e-4)
+- LSTM: n_steps=512, n_epochs=1, lr=3e-4 (n_epochs=1 required: multiple epochs on stale hidden states causes instability)
+- MLP: n_steps=512, n_epochs=4, lr=3e-4
 - Reported metric: mean best-checkpoint return across 3 seeds (not final, given known oscillation)
 
 ---
@@ -62,7 +65,14 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 
 **Primary metric:** Mean peak return across 3 seeds ± std.
 
-**Expected outcome:** CTM ≥ LSTM on PO variants; MLP strongest on full obs; MLP weakest on hardest PO (Acrobot-PO). This experiment is necessary to establish that CTM is a viable policy, not the main novelty.
+**Confirmed results (2026-05-11):**
+
+| Env | CTM peak | LSTM peak | MLP peak |
+|---|---|---|---|
+| CartPole-PO-v1 | **46 ± 16** | 27 ± 1 | 66 ± 6 |
+| LunarLander-PO | **-115.5 ± 9** | -161.3 ± 8 | -37.5 ± 2 |
+
+CTM outperforms LSTM on PO in both environments. MLP remains competitive via reactive control; the CTM > LSTM comparison is the main claim. This experiment is necessary to establish CTM as a viable policy, not the main novelty.
 
 ---
 
@@ -79,7 +89,7 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 
 **Key figure:** Side-by-side bar chart of partial-r per variable, CTM sync vs LSTM h_t. Shows the *mechanism difference* (sync head is directly readable; LSTM requires probing) not a magnitude claim.
 
-**Existing evidence:** CartPole-PO-v1 seed456: partial-r = 0.119 (cart_vel), 0.116 (pole_angvel). LunarLander-PO: partial-r up to 0.488 (vy).
+**Existing evidence:** CartPole-PO-v1 seed456: partial-r = 0.119 (cart_vel), 0.116 (pole_angvel). LunarLander-PO (n_ticks=5, old run): partial-r up to 0.488 (vy). To be re-run on n_ticks=20 checkpoints.
 
 ---
 
@@ -106,7 +116,7 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 
 **Method:**
 1. Compute sync matrix at each step as outer product of sync vector: M = s · sᵀ (16×16 symmetric)
-2. Snapshot at representative episode phases (e.g., Acrobot: initial swing, mid-swing, near-target)
+2. Snapshot at representative episode phases (e.g., LunarLander: descent, hover, landing)
 3. Visualise as heatmaps, annotated with episode phase
 
 **Claim level:** Qualitative only. Provides visual intuition for the "attention" analogy — which neuron pairs co-activate during which behavioural phases.
@@ -129,7 +139,7 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 
 ## 6. Expected Contributions
 
-1. **Empirical:** CTM solves Acrobot-PO and CartPole-PO-v1 competitively against LSTM under matched training budgets
+1. **Empirical:** CTM outperforms LSTM on CartPole-PO-v1 (+70%) and LunarLander-PO (+28%) under matched 300k-step budgets, confirmed across 3 seeds each
 2. **Interpretability:** Sync saliency analysis reveals hidden-variable tracking without probing classifiers, on two PO control tasks
 3. **Mechanistic:** Tick-progressive analysis (if confirmed) shows inference refinement over internal compute steps — connecting Sakana's chain-of-thought intuition to PO state estimation
 4. **Framing:** World models as conceptual lens for understanding CTM's emergent representations in model-free RL
@@ -138,9 +148,9 @@ All agents use PPO (discrete). No model-based baselines (Dreamer, TD-MPC2) — t
 
 ## 7. Open Questions / Risks
 
-| Risk | Mitigation |
-|---|---|
-| CTM still fails to learn on Acrobot-PO | n_ticks=20 + n_steps=512 is the hypothesis fix; if it fails, revert to CartPole-PO-v1 as sole PO benchmark |
-| Partial corrs remain too low to make the claim | Claim becomes "interpretability mechanism" (no probing needed) rather than "hidden-state encoding quality" |
-| Tick progression still flat with n_ticks=20 | Exp 3 becomes a negative finding; remove from main story, keep as appendix |
-| LSTM partial corrs equal or exceed CTM | Reframe: CTM's advantage is the *inspection mechanism* (direct readout vs probing), not tracking quality |
+| Risk | Status | Mitigation |
+|---|---|---|
+| ~~CTM fails on second PO env~~ | **Resolved** — LunarLander-PO works (CTM -115.5 > LSTM -161.3) | — |
+| Partial corrs remain too low | Open — re-running on n_ticks=20 checkpoints | Claim becomes "interpretability mechanism" (no probing needed) not tracking quality |
+| Tick progression still flat with n_ticks=20 | Open — analysis pending | Remove from main story, keep as appendix |
+| LSTM partial corrs equal or exceed CTM | Known from prior run (LunarLander LSTM vy=0.640 > CTM 0.488) | Reframe: advantage is *inspection mechanism* (direct readout vs probing), not tracking magnitude |
