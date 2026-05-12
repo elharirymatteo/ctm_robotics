@@ -62,14 +62,20 @@ class PPOTrainer:
         n_envs  = env.num_envs
         obs_dim = env.single_observation_space.shape[0]
 
+        # Detect continuous vs discrete action space
+        act_space = env.single_action_space
+        self.continuous = hasattr(act_space, 'shape') and len(act_space.shape) > 0
+        action_dim = act_space.shape[0] if self.continuous else 1
+
         self.buffer = RolloutBuffer(
             n_steps=config.n_steps,
             n_envs=n_envs,
             obs_dim=obs_dim,
-            action_dim=1,
+            action_dim=action_dim,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
             is_recurrent=is_recurrent,
+            continuous=self.continuous,
             device=train_config.device,
         )
 
@@ -78,6 +84,8 @@ class PPOTrainer:
         self.eval_returns: List[float] = []
         self.eval_steps  : List[int]   = []
         self.total_steps = 0
+        self._best_return       = float("-inf")
+        self._best_policy_state = None
 
         os.makedirs(train_config.log_dir, exist_ok=True)
 
@@ -91,8 +99,11 @@ class PPOTrainer:
         """
         self.policy.eval()
         n_envs  = self.env.num_envs
+        seq_len_snap = getattr(self.cfg, 'recurrent_seq_len', self.cfg.n_steps)
 
         for step in range(self.cfg.n_steps):
+            if self.is_recurrent and step % seq_len_snap == 0:
+                self.buffer.store_hidden_snapshot(step, hidden_states)
             obs_t = torch.FloatTensor(obs).to(self.device)  # (n_envs, obs_dim)
 
             with torch.no_grad():
@@ -167,9 +178,11 @@ class PPOTrainer:
             # CTM: (pre_h, post_list) — second element is a Python list
             pre_h, post_list = hidden_states
             fresh_pre_h, fresh_post_list = fresh
+            fresh_post_0 = fresh_post_list[0]
             for i in done_indices:
                 pre_h[i] = fresh_pre_h[i]
-                post_list[-1][i] = fresh_post_list[-1][i]
+                for p in post_list:
+                    p[i] = fresh_post_0[i]
             return (pre_h, post_list)
 
     # ── Update ────────────────────────────────────────────────────────────────
@@ -179,36 +192,137 @@ class PPOTrainer:
         self.policy.train()
         clip_eps = self.cfg.clip_eps
 
+        # Linearly anneal ent_coef if ent_coef_final is set.
+        # ent_anneal_fraction controls what fraction of total_steps the anneal spans
+        # (e.g. 0.5 = complete by 50% of training, stay at final value afterward).
+        ent_coef_final = getattr(self.cfg, 'ent_coef_final', None)
+        if ent_coef_final is not None:
+            anneal_frac = getattr(self.cfg, 'ent_anneal_fraction', 1.0)
+            anneal_steps = max(1, self.tcfg.total_steps * anneal_frac)
+            progress = min(1.0, self.total_steps / anneal_steps)
+            current_ent_coef = self.cfg.ent_coef + (ent_coef_final - self.cfg.ent_coef) * progress
+        else:
+            current_ent_coef = self.cfg.ent_coef
+
         pg_losses, vf_losses, ent_losses = [], [], []
 
         for epoch in range(self.cfg.n_epochs):
-            if self.is_recurrent:
-                batches = self.buffer.get_recurrent_batches(
-                    seq_len=self.cfg.n_steps)
+            if self.is_recurrent and hasattr(self.policy, 'ppo_loss_chunked'):
+                # CTM: full sequence so episode-resets keep hidden state correct
+                batches = self.buffer.get_recurrent_batches(seq_len=self.cfg.n_steps)
+            elif self.is_recurrent:
+                # LSTM: short chunks with stored h0 → correct ratios + many grad steps
+                seq_len = getattr(self.cfg, 'recurrent_seq_len', self.cfg.n_steps)
+                batches = self.buffer.get_recurrent_batches(seq_len=seq_len)
             else:
                 batches = self.buffer.get_stateless_batches(
                     batch_size=self.cfg.batch_size)
 
             for batch in batches:
-                if self.is_recurrent:
-                    # Recurrent: obs_seq is (1, seq_len, obs_dim)
-                    obs_seq    = batch["obs"]           # (1, T, obs_dim)
-                    act_seq    = batch["actions"]        # (1, T)
-                    old_lp     = batch["old_log_probs"]  # (1, T)
-                    adv        = batch["advantages"]     # (1, T)
-                    ret        = batch["returns"]        # (1, T)
+                if self.is_recurrent and hasattr(self.policy, 'ppo_loss_chunked'):
+                    # CTM: process each env as a separate mini-batch (Sakana's approach).
+                    # This gives n_envs gradient steps per epoch instead of 1, and later
+                    # mini-batches have ratio ≠ 1 (policy changed from prior steps) so
+                    # pg_loss becomes non-zero and the policy gradient signal is visible.
+                    obs_all  = batch["obs"]           # (n_envs, T, obs)
+                    act_all  = batch["actions"]        # (n_envs, T)
+                    lp_all   = batch["old_log_probs"]  # (n_envs, T)
+                    adv_all  = batch["advantages"]     # (n_envs, T) — already normalized globally
+                    ret_all  = batch["returns"]        # (n_envs, T)
+                    ep_all   = batch.get("ep_starts")  # (n_envs, T) or None
+                    stored   = batch.get("hidden_state_0")
+                    n_envs_b = obs_all.shape[0]
+
+                    _backbone = [p for n, p in self.policy.named_parameters()
+                                 if 'actor_head' not in n and 'critic_head' not in n]
+                    _actor    = list(self.policy.actor_head.parameters())
+                    _critic   = list(self.policy.critic_head.parameters())
+
+                    target_kl = getattr(self.cfg, 'target_kl', None)
+                    for ei in range(n_envs_b):
+                        obs_e = obs_all[ei:ei+1]
+                        act_e = act_all[ei:ei+1]
+                        lp_e  = lp_all[ei:ei+1]
+                        adv_e = adv_all[ei:ei+1]
+                        # Renormalize per mini-batch so later mini-batches (ratio≠1) see
+                        # proper advantage scale even after earlier policy updates.
+                        adv_e = (adv_e - adv_e.mean()) / (adv_e.std() + 1e-8)
+                        ret_e = ret_all[ei:ei+1]
+                        ep_e  = ep_all[ei:ei+1] if ep_all is not None else None
+
+                        if stored is not None and isinstance(stored[1], list):
+                            h0_e = (
+                                torch.FloatTensor(stored[0][ei:ei+1]).to(self.device),
+                                [torch.FloatTensor(p[ei:ei+1]).to(self.device)
+                                 for p in stored[1]],
+                            )
+                        else:
+                            h0_e = self.policy.init_hidden(1, self.device)
+
+                        self.optimizer.zero_grad()
+                        diag = self.policy.ppo_loss_chunked(
+                            obs_e, act_e, h0_e,
+                            dones_seq=ep_e,
+                            old_log_probs=lp_e, advantages=adv_e, returns=ret_e,
+                            clip_eps=clip_eps, vf_coef=self.cfg.vf_coef,
+                            ent_coef=current_ent_coef)
+                        for _grp in (_backbone, _actor, _critic):
+                            nn.utils.clip_grad_norm_(_grp, self.cfg.max_grad_norm)
+                        self.optimizer.step()
+
+                        pg_losses.append(diag["pg_loss"])
+                        vf_losses.append(diag["vf_loss"])
+                        ent_losses.append(diag["ent_loss"])
+
+                        if target_kl is not None and diag.get("approx_kl", 0) > target_kl:
+                            break  # Policy moved far enough — stop early to prevent overshoot
+
+                elif self.is_recurrent:
+                    # LSTM: standard recurrent evaluate_actions
+                    obs_seq    = batch["obs"]
+                    act_seq    = batch["actions"]
+                    old_lp     = batch["old_log_probs"]
+                    adv        = batch["advantages"]
+                    ret        = batch["returns"]
                     n_envs_b   = obs_seq.shape[0]
 
-                    h0 = self.policy.init_hidden(n_envs_b, self.device)
+                    # Use the hidden state from collection to keep ratios ≈ 1.0
+                    stored = batch.get("hidden_state_0")
+                    if stored is not None:
+                        h_np, c_np = stored
+                        h0 = (torch.FloatTensor(h_np).to(self.device),
+                              torch.FloatTensor(c_np).to(self.device))
+                    else:
+                        h0 = self.policy.init_hidden(n_envs_b, self.device)
                     log_probs, entropies, values = \
-                        self.policy.evaluate_actions(obs_seq, act_seq, h0)
+                        self.policy.evaluate_actions(
+                            obs_seq, act_seq, h0,
+                            dones_seq=batch.get("ep_starts"))
 
                     old_lp_flat = old_lp.reshape(-1)
                     adv_flat    = adv.reshape(-1)
                     ret_flat    = ret.reshape(-1)
 
+                    ratio = torch.exp((log_probs - old_lp_flat).clamp(-3, 3))
+                    pg1   = ratio * adv_flat
+                    pg2   = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_flat
+                    pg_loss = -torch.min(pg1, pg2).mean()
+                    vf_loss = F.mse_loss(values, ret_flat)
+                    ent_loss = -entropies.mean()
+                    loss = pg_loss + self.cfg.vf_coef * vf_loss + current_ent_coef * ent_loss
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.policy.parameters(), self.cfg.max_grad_norm)
+                    self.optimizer.step()
+
+                    pg_losses.append(pg_loss.item())
+                    vf_losses.append(vf_loss.item())
+                    ent_losses.append(ent_loss.item())
+
                 else:
-                    # Stateless
+                    # Stateless (MLP)
                     obs     = batch["obs"]
                     actions = batch["actions"]
                     old_lp  = batch["old_log_probs"]
@@ -219,32 +333,23 @@ class PPOTrainer:
                         self.policy.evaluate_actions(obs, actions)
                     old_lp_flat = old_lp
 
-                # PPO clipped surrogate loss
-                ratio = torch.exp(log_probs - old_lp_flat)
-                pg1   = ratio * adv_flat
-                pg2   = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_flat
-                pg_loss = -torch.min(pg1, pg2).mean()
+                    ratio = torch.exp((log_probs - old_lp_flat).clamp(-3, 3))
+                    pg1   = ratio * adv_flat
+                    pg2   = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_flat
+                    pg_loss = -torch.min(pg1, pg2).mean()
+                    vf_loss = F.mse_loss(values, ret_flat)
+                    ent_loss = -entropies.mean()
+                    loss = pg_loss + self.cfg.vf_coef * vf_loss + current_ent_coef * ent_loss
 
-                # Value function loss (clipped)
-                vf_loss = F.mse_loss(values, ret_flat)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.policy.parameters(), self.cfg.max_grad_norm)
+                    self.optimizer.step()
 
-                # Entropy bonus
-                ent_loss = -entropies.mean()
-
-                loss = (pg_loss
-                        + self.cfg.vf_coef * vf_loss
-                        + self.cfg.ent_coef * ent_loss)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.policy.parameters(),
-                    self.cfg.max_grad_norm)
-                self.optimizer.step()
-
-                pg_losses.append(pg_loss.item())
-                vf_losses.append(vf_loss.item())
-                ent_losses.append(ent_loss.item())
+                    pg_losses.append(pg_loss.item())
+                    vf_losses.append(vf_loss.item())
+                    ent_losses.append(ent_loss.item())
 
         return {
             "pg_loss":  np.mean(pg_losses),
@@ -276,7 +381,8 @@ class PPOTrainer:
                     else:
                         action, _, _, _ = self.policy.get_action(obs_t)
 
-                obs, reward, term, trunc, _ = eval_env.step(action.item())
+                act = action.cpu().numpy()[0] if self.continuous else action.item()
+                obs, reward, term, trunc, _ = eval_env.step(act)
                 ep_ret += reward
                 done = term or trunc
 
@@ -326,6 +432,11 @@ class PPOTrainer:
                 self.eval_returns.append(mean_ret)
                 self.eval_steps.append(self.total_steps)
                 last_eval = self.total_steps
+                if mean_ret > self._best_return:
+                    self._best_return = mean_ret
+                    self._best_policy_state = {
+                        k: v.cpu().clone() for k, v in self.policy.state_dict().items()
+                    }
 
                 if verbose:
                     elapsed = time.time() - start_time
@@ -338,8 +449,9 @@ class PPOTrainer:
         return self.eval_steps, self.eval_returns
 
     def save(self, path: str):
+        best_state = self._best_policy_state or self.policy.state_dict()
         torch.save({
-            "policy_state": self.policy.state_dict(),
+            "policy_state": best_state,
             "optimizer_state": self.optimizer.state_dict(),
             "eval_steps": self.eval_steps,
             "eval_returns": self.eval_returns,
@@ -349,7 +461,7 @@ class PPOTrainer:
             print(f"  Saved to {path}")
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(ckpt["policy_state"])
         self.optimizer.load_state_dict(ckpt["optimizer_state"])
         self.eval_steps   = ckpt["eval_steps"]

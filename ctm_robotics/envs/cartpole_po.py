@@ -56,27 +56,38 @@ class PartialObsCartPole(gym.Wrapper):
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        self.last_full_obs = obs.copy()
         return self._mask(obs), info
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self.last_full_obs = obs.copy()
         return self._mask(obs), reward, terminated, truncated, info
 
 
 def make_env(env_id: str, seed: int = 0, rank: int = 0):
     """
     Factory for creating environments, compatible with gymnasium vectorized envs.
-
-    Args:
-        env_id:  "CartPole-v1" or "CartPole-PO-v1"
-        seed:    base random seed
-        rank:    worker index (added to seed for diversity)
+    Supports CartPole-v1, CartPole-PO-v1, LunarLander-v3, LunarLander-PO-v3.
     """
+    from ctm_robotics.envs.lunarlander_po import PartialObsLunarLander
+    from ctm_robotics.envs.pendulum_po import PartialObsPendulum
+    from ctm_robotics.envs.bipedal_po import PartialObsBipedalWalker
+    from ctm_robotics.envs.acrobot_po import PartialObsAcrobot
+
+    _PO_WRAPPERS = {
+        "CartPole-PO-v1": PartialObsCartPole,
+        "LunarLander-PO-v3": PartialObsLunarLander,
+        "Pendulum-PO-v1": PartialObsPendulum,
+        "BipedalWalker-PO-v3": PartialObsBipedalWalker,
+        "Acrobot-PO-v1": PartialObsAcrobot,
+    }
+
     def _init():
-        if env_id == "CartPole-PO-v1":
-            env = PartialObsCartPole()
+        if env_id in _PO_WRAPPERS:
+            env = _PO_WRAPPERS[env_id]()
         else:
-            env = gym.make("CartPole-v1")
+            env = gym.make(env_id)
         env.reset(seed=seed + rank)
         return env
     return _init
@@ -95,5 +106,16 @@ def make_vec_env(env_id: str, n_envs: int, seed: int = 0):
 gym.register(
     id="CartPole-PO-v1",
     entry_point=PartialObsCartPole,
+    max_episode_steps=500,
+)
+
+# CartPole-PO-v2: mask pole_angle (index 2).
+# obs = [cart_pos, cart_vel, 0, pole_angvel]
+# MLP can only do derivative control (angvel only) → limited ~30-60.
+# LSTM integrates angvel → estimates angle → near-optimal.
+# This design has a much cleaner memory advantage than v1.
+gym.register(
+    id="CartPole-PO-v2",
+    entry_point=lambda: PartialObsCartPole(masked_indices=(2,)),
     max_episode_steps=500,
 )

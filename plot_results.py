@@ -18,9 +18,10 @@ import numpy as np
 import torch
 import gymnasium as gym
 
-import ctm_robotics.envs  # noqa — triggers CartPole-PO-v1 registration
+import ctm_robotics.envs  # noqa — triggers PO variant registration
 import ctm_robotics.config as C
 from ctm_robotics.envs.cartpole_po import PartialObsCartPole
+from ctm_robotics.envs.lunarlander_po import PartialObsLunarLander
 from ctm_robotics.models import CTMActorCritic
 from ctm_robotics.analysis.visualize import (
     plot_training_curves_both_envs,
@@ -65,12 +66,18 @@ def run_ctm_analysis(env_id, results_dir, n_steps_collect=200):
     """Load a trained CTM checkpoint and produce interpretability plots."""
     print("\n-- CTM interpretability analysis --")
 
-    if env_id == C.ENV_PO:
-        env = PartialObsCartPole()
-        obs_names = ["cart_pos", "cart_vel(hidden)", "pole_ang", "pole_angvel(hidden)"]
+    OBS_NAMES = {
+        C.ENV_FULL:   ["cart_pos", "cart_vel", "pole_ang", "pole_angvel"],
+        C.ENV_PO:     ["cart_pos", "cart_vel(hidden)", "pole_ang", "pole_angvel(hidden)"],
+        C.LUNAR_FULL: ["x", "y", "vx", "vy", "angle", "ang_vel", "left_leg", "right_leg"],
+        C.LUNAR_PO:   ["x", "y", "vx(hidden)", "vy(hidden)", "angle", "ang_vel(hidden)", "left_leg", "right_leg"],
+    }
+    PO_WRAPPERS = {C.ENV_PO: PartialObsCartPole, C.LUNAR_PO: PartialObsLunarLander}
+    if env_id in PO_WRAPPERS:
+        env = PO_WRAPPERS[env_id]()
     else:
-        env = gym.make("CartPole-v1")
-        obs_names = ["cart_pos", "cart_vel", "pole_ang", "pole_angvel"]
+        env = gym.make(env_id)
+    obs_names = OBS_NAMES.get(env_id, [f"obs[{i}]" for i in range(env.observation_space.shape[0])])
 
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
@@ -131,6 +138,7 @@ def run_ctm_analysis(env_id, results_dir, n_steps_collect=200):
             obs=obs_arr[min(5, len(obs_arr) - 1)],
             episode_step=min(5, len(dynamics_snapshots) - 1),
             save_path=os.path.join(results_dir, "ctm_neural_dynamics.png"),
+            obs_names=obs_names,
         )
 
     if sync_matrices:
@@ -155,8 +163,8 @@ def main():
     p.add_argument("--results-dir", default="results")
     p.add_argument("--ctm-analysis", action="store_true",
                    help="Also re-run CTM interpretability plots from checkpoint")
-    p.add_argument("--ctm-env", choices=["full", "po"], default="po",
-                   help="Which env to use for CTM analysis (default: po)")
+    p.add_argument("--ctm-env", choices=["full", "po", "lunar_full", "lunar_po"],
+                   default="po", help="Which env for CTM analysis")
     p.add_argument("--ctm-steps", type=int, default=200,
                    help="Number of steps to collect for CTM analysis")
     args = p.parse_args()
@@ -166,19 +174,34 @@ def main():
     po_res = {a: load(a, C.ENV_PO, rd) for a in AGENTS}
 
     plot_training_curves_both_envs(
-        full_results=full_res,
-        po_results=po_res,
+        full_results=full_res, po_results=po_res,
         save_path=os.path.join(rd, "training_curves_both.png"),
     )
-
     plot_final_summary(
-        results_full=full_res,
-        results_po=po_res,
+        results_full=full_res, results_po=po_res,
         save_path=os.path.join(rd, "final_summary.png"),
     )
 
+    # LunarLander plots (if results exist)
+    lunar_full = {a: load(a, C.LUNAR_FULL, rd) for a in AGENTS}
+    lunar_po = {a: load(a, C.LUNAR_PO, rd) for a in AGENTS}
+    has_lunar = any(d["steps"] for d in lunar_full.values()) or \
+                any(d["steps"] for d in lunar_po.values())
+    if has_lunar:
+        plot_training_curves_both_envs(
+            full_results=lunar_full, po_results=lunar_po,
+            save_path=os.path.join(rd, "training_curves_lunar.png"),
+            env_label="LunarLander",
+        )
+        plot_final_summary(
+            results_full=lunar_full, results_po=lunar_po,
+            save_path=os.path.join(rd, "final_summary_lunar.png"),
+        )
+
     if args.ctm_analysis:
-        env_id = C.ENV_PO if args.ctm_env == "po" else C.ENV_FULL
+        env_map = {"full": C.ENV_FULL, "po": C.ENV_PO,
+                   "lunar_full": C.LUNAR_FULL, "lunar_po": C.LUNAR_PO}
+        env_id = env_map[args.ctm_env]
         run_ctm_analysis(env_id, rd, n_steps_collect=args.ctm_steps)
 
     print("Plots saved to", rd)

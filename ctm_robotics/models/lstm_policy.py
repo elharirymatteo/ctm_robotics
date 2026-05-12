@@ -110,7 +110,8 @@ class LSTMActorCritic(nn.Module):
         action = dist.sample()
         return action, dist.log_prob(action), values, dist.entropy(), hidden_state
 
-    def evaluate_actions(self, obs_seq, actions_seq, hidden_state_0, dones_seq=None):
+    def evaluate_actions(self, obs_seq, actions_seq, hidden_state_0, dones_seq=None,
+                         tbptt_k: int = 16):
         """
         Evaluate a sequence of (obs, action) pairs collected from a rollout.
         Used during the PPO update step.
@@ -119,7 +120,8 @@ class LSTMActorCritic(nn.Module):
             obs_seq:       (batch, seq_len, obs_dim)  — one episode per row
             actions_seq:   (batch, seq_len)
             hidden_state_0:(h0, c0) at episode start, (n_layers, batch, hidden_size)
-            dones_seq:     (batch, seq_len) bool — reset hidden at episode boundaries
+            dones_seq:     (batch, seq_len) float — reset hidden at episode boundaries
+            tbptt_k:       BPTT truncation length (default 16)
 
         Returns:
             log_probs:  (batch * seq_len,)
@@ -127,19 +129,25 @@ class LSTMActorCritic(nn.Module):
             values:     (batch * seq_len,)
         """
         batch, seq_len, _ = obs_seq.shape
-        x = self.encoder(obs_seq.view(batch * seq_len, -1))
-        x = x.view(batch, seq_len, -1)
+        all_logits, all_values = [], []
+        h, c = hidden_state_0
 
-        # Run full sequence through LSTM
-        out, _ = self.lstm(x, hidden_state_0)   # (batch, seq_len, hidden_size)
+        for t in range(seq_len):
+            # Reset hidden state for envs starting a new episode.
+            if dones_seq is not None and dones_seq[:, t].any():
+                mask = (dones_seq[:, t] > 0.5).float().view(1, batch, 1)
+                h = h * (1 - mask)
+                c = c * (1 - mask)
 
-        # Flatten for heads
-        out_flat = out.view(batch * seq_len, -1)
-        logits   = self.actor_head(out_flat)
-        values   = self.critic_head(out_flat).squeeze(-1)
+            x = self.encoder(obs_seq[:, t, :]).unsqueeze(1)  # (batch, 1, hidden_size)
+            out, (h, c) = self.lstm(x, (h, c))
+            if (t + 1) % tbptt_k == 0:
+                h, c = h.detach(), c.detach()
+            out = out.squeeze(1)                              # (batch, hidden_size)
+            all_logits.append(self.actor_head(out))
+            all_values.append(self.critic_head(out).squeeze(-1))
 
-        dist     = torch.distributions.Categorical(logits=logits)
-        log_probs = dist.log_prob(actions_seq.view(-1))
-        entropies = dist.entropy()
-
-        return log_probs, entropies, values
+        logits_flat = torch.stack(all_logits, dim=1).view(batch * seq_len, -1)
+        values_flat = torch.stack(all_values, dim=1).view(-1)
+        dist = torch.distributions.Categorical(logits=logits_flat)
+        return dist.log_prob(actions_seq.reshape(-1)), dist.entropy(), values_flat

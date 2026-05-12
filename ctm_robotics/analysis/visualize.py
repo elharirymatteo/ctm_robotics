@@ -127,6 +127,7 @@ def plot_training_curves_both_envs(
     po_results:   Dict[str, Dict],
     save_path:    str = "results/training_curves_both.png",
     smooth_window: int = 3,
+    env_label: str = "CartPole",
 ):
     """Side-by-side: full obs vs partial obs environments."""
     set_style()
@@ -140,8 +141,8 @@ def plot_training_curves_both_envs(
         return np.convolve(x, np.ones(w) / w, mode="valid")
 
     for ax, results, title in [
-        (axes[0], full_results, "CartPole-v1  (fully observable)"),
-        (axes[1], po_results,   "CartPole-PO  (velocities hidden)"),
+        (axes[0], full_results, f"{env_label}  (fully observable)"),
+        (axes[1], po_results,   f"{env_label}-PO  (velocities hidden)"),
     ]:
         for agent, data in results.items():
             if not data["steps"]:
@@ -182,6 +183,7 @@ def plot_neural_dynamics(
     obs: Optional[np.ndarray] = None,
     episode_step: int = 0,
     save_path: str = "results/ctm_neural_dynamics.png",
+    obs_names: Optional[List[str]] = None,
 ):
     """
     Heatmap of neuron post-activations over internal ticks.
@@ -216,7 +218,7 @@ def plot_neural_dynamics(
 
     if obs is not None:
         ax_obs = fig.add_subplot(gs[1])
-        obs_labels = ["cart_pos", "cart_vel", "pole_θ", "pole_ω"][:len(obs)]
+        obs_labels = (obs_names or [f"obs[{i}]" for i in range(len(obs))])[:len(obs)]
         ax_obs.bar(range(len(obs)), obs, color=COLORS["ppo_ctm"], alpha=0.7)
         ax_obs.set_xticks(range(len(obs)))
         ax_obs.set_xticklabels(obs_labels, fontsize=9)

@@ -28,6 +28,7 @@ class RolloutBuffer:
                  obs_dim: int, action_dim: int,
                  gamma: float = 0.99, gae_lambda: float = 0.95,
                  is_recurrent: bool = False,
+                 continuous: bool = False,
                  device: str = "cpu"):
         self.n_steps     = n_steps
         self.n_envs      = n_envs
@@ -36,6 +37,7 @@ class RolloutBuffer:
         self.gamma       = gamma
         self.gae_lambda  = gae_lambda
         self.is_recurrent = is_recurrent
+        self.continuous   = continuous
         self.device      = device
 
         self.reset()
@@ -43,7 +45,11 @@ class RolloutBuffer:
     def reset(self):
         self.observations = np.zeros((self.n_steps, self.n_envs, self.obs_dim),
                                      dtype=np.float32)
-        self.actions      = np.zeros((self.n_steps, self.n_envs), dtype=np.int64)
+        if self.continuous:
+            self.actions = np.zeros((self.n_steps, self.n_envs, self.action_dim),
+                                    dtype=np.float32)
+        else:
+            self.actions = np.zeros((self.n_steps, self.n_envs), dtype=np.int64)
         self.rewards      = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
         self.dones        = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
         self.values       = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
@@ -56,6 +62,29 @@ class RolloutBuffer:
         # For recurrent policies: store hidden states at step boundaries
         # So we know where to reset them during BPTT
         self.episode_starts = np.zeros((self.n_steps, self.n_envs), dtype=np.float32)
+
+        # LSTM hidden-state snapshots at chunk-start positions.
+        # Key: step index (0, seq_len, 2*seq_len, …)
+        # Value: (h_np, c_np) numpy arrays (n_layers, n_envs, hidden_size)
+        self.hidden_snapshots: dict = {}
+
+    def store_hidden_snapshot(self, step: int, hidden) -> None:
+        """Save LSTM or CTM hidden state at a chunk-start step."""
+        if not isinstance(hidden, tuple) or len(hidden) != 2:
+            return
+        first, second = hidden
+        if isinstance(second, torch.Tensor):
+            # LSTM: (h, c)
+            self.hidden_snapshots[step] = (
+                first.detach().cpu().numpy().copy(),
+                second.detach().cpu().numpy().copy(),
+            )
+        elif isinstance(second, list) and all(isinstance(p, torch.Tensor) for p in second):
+            # CTM: (pre_h, post_list)
+            self.hidden_snapshots[step] = (
+                first.detach().cpu().numpy().copy(),
+                [p.detach().cpu().numpy().copy() for p in second],
+            )
 
     def add(self, obs, action, reward, done, value, log_prob, episode_start=None):
         """
@@ -122,20 +151,24 @@ class RolloutBuffer:
         indices = np.random.permutation(n)
 
         obs_flat    = self.observations.reshape(n, self.obs_dim)
-        actions_flat = self.actions.reshape(n)
+        if self.continuous:
+            actions_flat = self.actions.reshape(n, self.action_dim)
+        else:
+            actions_flat = self.actions.reshape(n)
         log_probs_flat = self.log_probs.reshape(n)
         advantages_flat = self.advantages.reshape(n)
         returns_flat = self.returns.reshape(n)
 
-        # Normalize advantages
         advantages_flat = (advantages_flat - advantages_flat.mean()) / \
                           (advantages_flat.std() + 1e-8)
 
         for start in range(0, n, batch_size):
             idx = indices[start: start + batch_size]
+            act_t = torch.FloatTensor(actions_flat[idx]) if self.continuous \
+                    else torch.LongTensor(actions_flat[idx])
             yield {
                 "obs":        torch.FloatTensor(obs_flat[idx]).to(self.device),
-                "actions":    torch.LongTensor(actions_flat[idx]).to(self.device),
+                "actions":    act_t.to(self.device),
                 "old_log_probs": torch.FloatTensor(log_probs_flat[idx]).to(self.device),
                 "advantages": torch.FloatTensor(advantages_flat[idx]).to(self.device),
                 "returns":    torch.FloatTensor(returns_flat[idx]).to(self.device),
@@ -143,43 +176,39 @@ class RolloutBuffer:
 
     def get_recurrent_batches(self, seq_len: int):
         """
-        For recurrent (LSTM, CTM) policies: yield sequences aligned with episodes.
+        For recurrent (LSTM, CTM) policies: yield all-env batches.
 
-        We split the rollout into non-overlapping sequences of length seq_len,
-        keeping n_envs as the batch dimension. Each sequence starts where the
-        last one ended (or at an episode boundary).
-
-        Returns tuples of (obs_seq, actions_seq, log_probs_seq,
-                           advantages_seq, returns_seq, is_first_seq)
-        where is_first_seq[b,t] = True means the hidden state should be reset.
+        Yields (n_envs, seq_len, ...) tensors so all environments are
+        processed in a single batched forward pass, improving GPU utilization
+        vs. the old per-env approach (batch=1).
         """
-        # Shape: (n_steps, n_envs, ...)
-        # We treat each env as an independent trajectory, yielding sequences
-        # of length seq_len from each.
-
-        # Normalize advantages
         adv = self.advantages.copy()
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        for env_idx in range(self.n_envs):
-            obs_e        = self.observations[:, env_idx, :]  # (T, obs_dim)
-            act_e        = self.actions[:, env_idx]           # (T,)
-            lp_e         = self.log_probs[:, env_idx]         # (T,)
-            adv_e        = adv[:, env_idx]                    # (T,)
-            ret_e        = self.returns[:, env_idx]           # (T,)
-            ep_start_e   = self.episode_starts[:, env_idx]   # (T,)
+        # Transpose from (T, n_envs, ...) → (n_envs, T, ...)
+        obs_all = self.observations.transpose(1, 0, 2)        # (n_envs, T, obs_dim)
+        lp_all  = self.log_probs.T                             # (n_envs, T)
+        adv_all = adv.T                                        # (n_envs, T)
+        ret_all = self.returns.T                               # (n_envs, T)
+        ep_all  = self.episode_starts.T                        # (n_envs, T)
+        if self.continuous:
+            act_all = self.actions.transpose(1, 0, 2)          # (n_envs, T, action_dim)
+        else:
+            act_all = self.actions.T                           # (n_envs, T)
 
-            T = self.n_steps
-            for start in range(0, T, seq_len):
-                end = min(start + seq_len, T)
-                s = end - start
-
-                yield {
-                    "obs":        torch.FloatTensor(obs_e[start:end]).unsqueeze(0).to(self.device),
-                    "actions":    torch.LongTensor(act_e[start:end]).unsqueeze(0).to(self.device),
-                    "old_log_probs": torch.FloatTensor(lp_e[start:end]).unsqueeze(0).to(self.device),
-                    "advantages": torch.FloatTensor(adv_e[start:end]).unsqueeze(0).to(self.device),
-                    "returns":    torch.FloatTensor(ret_e[start:end]).unsqueeze(0).to(self.device),
-                    "ep_starts":  torch.FloatTensor(ep_start_e[start:end]).unsqueeze(0).to(self.device),
-                    "seq_len":    s,
-                }
+        T = self.n_steps
+        for start in range(0, T, seq_len):
+            end = min(start + seq_len, T)
+            act_t = torch.FloatTensor(act_all[:, start:end]) if self.continuous \
+                    else torch.LongTensor(act_all[:, start:end])
+            batch = {
+                "obs":           torch.FloatTensor(obs_all[:, start:end]).to(self.device),
+                "actions":       act_t.to(self.device),
+                "old_log_probs": torch.FloatTensor(lp_all[:, start:end]).to(self.device),
+                "advantages":    torch.FloatTensor(adv_all[:, start:end]).to(self.device),
+                "returns":       torch.FloatTensor(ret_all[:, start:end]).to(self.device),
+                "ep_starts":     torch.FloatTensor(ep_all[:, start:end]).to(self.device),
+                "seq_len":       end - start,
+                "hidden_state_0": self.hidden_snapshots.get(start),  # None for CTM
+            }
+            yield batch

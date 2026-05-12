@@ -131,8 +131,13 @@ class NeuronLevelModels(nn.Module):
         self._init()
 
     def _init(self):
-        nn.init.kaiming_uniform_(self.w1,  a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.w_out, a=math.sqrt(5))
+        # w1: (D, H, M) — each neuron has an independent M→H linear transform
+        # Correct fan_in is M, not H*M as kaiming computes for 3D tensors
+        bound = 1.0 / math.sqrt(self.M)
+        nn.init.uniform_(self.w1, -bound, bound)
+        # w_out: (D, 1, H) — each neuron: H→1
+        bound = 1.0 / math.sqrt(self.w_out.shape[-1])
+        nn.init.uniform_(self.w_out, -bound, bound)
 
     def forward(self, pre_act_history):
         """
@@ -191,22 +196,19 @@ class SynchronizationHead(nn.Module):
         self.register_buffer('decays', decays)  # (synch_window,)
 
         # "first-last" neuron pairs: first D_out//2 and last D_out//2 neurons
-        # Their cross-correlations form the synchronization representation
         half = n_synch_out // 2
-        rows = list(range(half)) + list(range(d_model - half, d_model))
-        cols = list(range(half)) + list(range(d_model - half, d_model))
-        # All (row, col) pairs from these neurons → n_synch_out^2 pairs
-        # In practice we use the diagonal (same-index pairs) + cross pairs
-        # For simplicity: use the upper-triangle of the (rows × cols) block
-        pairs_r, pairs_c = [], []
-        for r in rows:
-            for c in cols:
-                if c >= r:
-                    pairs_r.append(r)
-                    pairs_c.append(c)
-        # Limit to n_synch_out pairs
-        pairs_r = pairs_r[:n_synch_out]
-        pairs_c = pairs_c[:n_synch_out]
+        neurons = list(range(half)) + list(range(d_model - half, d_model))
+        # Build all upper-triangle pairs, then evenly sample n_synch_out
+        all_r, all_c = [], []
+        for i, r in enumerate(neurons):
+            for j, c in enumerate(neurons):
+                if j >= i:
+                    all_r.append(r)
+                    all_c.append(c)
+        n_total = len(all_r)
+        step = n_total / n_synch_out
+        pairs_r = [all_r[int(i * step)] for i in range(n_synch_out)]
+        pairs_c = [all_c[int(i * step)] for i in range(n_synch_out)]
         self.register_buffer('pairs_r', torch.tensor(pairs_r, dtype=torch.long))
         self.register_buffer('pairs_c', torch.tensor(pairs_c, dtype=torch.long))
 
@@ -239,14 +241,12 @@ class SynchronizationHead(nn.Module):
 
         window = hist[..., -W:]          # (batch, D, W)
         decays = self.decays[-W:]        # (W,)
-        weighted = window * decays       # (batch, D, W)
 
-        # Synchronization for selected pairs:
-        # S[i,j] = sum_t( weighted_i_t * weighted_j_t )
-        #        = dot_product of weighted time-series of neuron i and j
-        row_vecs = weighted[:, self.pairs_r, :]   # (batch, n_pairs, W)
-        col_vecs = weighted[:, self.pairs_c, :]   # (batch, n_pairs, W)
-        sync_raw = (row_vecs * col_vecs).sum(-1)  # (batch, n_pairs)
+        # S[i,j] = sum_t( decay_t * z_i^t * z_j^t )
+        # Apply decay once (to one side) to avoid squaring the decay factor
+        row_vecs = window[:, self.pairs_r, :] * decays  # (batch, n_pairs, W)
+        col_vecs = window[:, self.pairs_c, :]            # (batch, n_pairs, W)
+        sync_raw = (row_vecs * col_vecs).sum(-1)         # (batch, n_pairs)
 
         return self.proj(sync_raw)   # (batch, n_synch_out)
 
@@ -302,16 +302,27 @@ class CTMActorCritic(nn.Module):
                                               synch_window, synch_decay)
 
         # ── Learned initial activated state (as in Sakana repo) ──────────
-        self.init_post_act = nn.Parameter(torch.zeros(1, d_model))
+        self.init_post_act = nn.Parameter(torch.randn(1, d_model) * 0.1)
+
+        # ── Normalize post-activations for stable sync products ────────────
+        self.post_norm = nn.LayerNorm(d_model)
 
         # ── Actor / Critic heads read from synchronization ────────────────
-        self.actor_head  = nn.Linear(n_synch_out, action_dim)
-        self.critic_head = nn.Linear(n_synch_out, 1)
+        # 2-layer MLPs matching Sakana's RL implementation (std=1 throughout)
+        def _make_head(out_dim):
+            m = nn.Sequential(
+                nn.Linear(n_synch_out, 64), nn.ReLU(),
+                nn.Linear(64, 64), nn.ReLU(),
+                nn.Linear(64, out_dim),
+            )
+            for layer in m:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=1.0)
+                    nn.init.zeros_(layer.bias)
+            return m
 
-        nn.init.orthogonal_(self.actor_head.weight,  gain=0.01)
-        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
-        nn.init.zeros_(self.actor_head.bias)
-        nn.init.zeros_(self.critic_head.bias)
+        self.actor_head  = _make_head(action_dim)
+        self.critic_head = _make_head(1)
 
         # ── Saliency storage (filled during forward, readable externally) ─
         self.last_sync_repr    = None   # (batch, n_synch_out)
@@ -326,9 +337,10 @@ class CTMActorCritic(nn.Module):
         post_act_history: [initial_post_act]  — (batch, D)
         """
         pre_h = torch.zeros(batch_size, self.d_model, self.M, device=device)
-        # Use learned initial post-activation, broadcast to batch
-        post_0 = self.init_post_act.expand(batch_size, -1).detach().clone()
-        return (pre_h, [post_0])
+        # Initialize post_list with synch_window copies so episode resets in ppo_loss_chunked
+        # (which also produce synch_window copies) are consistent with collection.
+        post_0 = self.init_post_act.to(device).expand(batch_size, -1).detach().clone()
+        return (pre_h, [post_0] * self.synch_window)
 
     def _detach_hidden(self, hidden_state):
         """Detach hidden state from computation graph (between rollout chunks)."""
@@ -373,7 +385,7 @@ class CTMActorCritic(nn.Module):
                                dim=-1)                    # (batch, D, M)
 
             # NLMs: each neuron processes its private history
-            post_act = self.nlms(pre_h)                   # (batch, D)
+            post_act = self.post_norm(self.nlms(pre_h))   # (batch, D)
             tick_post_acts.append(post_act)
 
         # Update post-activation history (append all new ticks)
@@ -428,8 +440,27 @@ class CTMActorCritic(nn.Module):
 
         hidden = hidden_state_0
         for t in range(seq_len):
+            # Reset hidden state at episode boundaries
+            # Detach fresh values to avoid growing autograd graph at every boundary
+            # (init_post_act still gets gradient from the initial h0 at sequence start)
+            if dones_seq is not None:
+                mask = dones_seq[:, t]
+                if mask.any():
+                    pre_h, post_list = hidden
+                    fresh_pre = torch.zeros_like(pre_h)
+                    fresh_p0 = self.init_post_act.expand(batch, -1).detach()
+                    m2 = (mask > 0.5).unsqueeze(-1)              # (batch, 1)
+                    m3 = m2.unsqueeze(-1)                        # (batch, 1, 1)
+                    pre_h = torch.where(m3, fresh_pre, pre_h)
+                    post_list = [torch.where(m2, fresh_p0, p) for p in post_list]
+                    hidden = (pre_h, post_list)
+
             obs_t = obs_seq[:, t, :]              # (batch, obs_dim)
             logits, vals, hidden = self.forward(obs_t, hidden)
+            # Truncate BPTT between env steps: gradient flows through
+            # the 5 internal ticks within this step but not across steps.
+            # CTM retains recurrent memory via the hidden state contents.
+            hidden = self._detach_hidden(hidden)
             all_logits.append(logits)
             all_values.append(vals)
 
@@ -443,6 +474,86 @@ class CTMActorCritic(nn.Module):
         values    = all_values.view(-1)
 
         return log_probs, entropies, values
+
+    # ── Chunked PPO loss (avoids graph accumulation) ────────────────────────
+
+    def ppo_loss_chunked(self, obs_seq, actions_seq, hidden_state_0,
+                         dones_seq, old_log_probs, advantages, returns,
+                         clip_eps=0.2, vf_coef=0.5, ent_coef=0.01,
+                         chunk_size=128):
+        """
+        Compute PPO loss with TBPTT (truncated BPTT over chunks of chunk_size).
+
+        Within each chunk, gradient flows freely through hidden states.
+        Hidden state is detached only at chunk boundaries, allowing the CTM
+        to learn temporal memory spanning up to chunk_size env steps.
+
+        Gradients accumulated on self.parameters(). Caller zero_grads before,
+        optimizer.step after.
+        """
+        batch, seq_len, _ = obs_seq.shape
+        pg_sum = vf_sum = ent_sum = kl_sum = 0.0
+
+        hidden = hidden_state_0
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            chunk_logits, chunk_values = [], []
+
+            for t in range(chunk_start, chunk_end):
+                if dones_seq is not None:
+                    mask = dones_seq[:, t]
+                    if mask.any():
+                        pre_h, post_list = hidden
+                        fresh_pre = torch.zeros_like(pre_h)
+                        fresh_p0 = self.init_post_act.to(obs_seq.device).expand(batch, -1).detach()
+                        m2 = (mask > 0.5).unsqueeze(-1)
+                        m3 = m2.unsqueeze(-1)
+                        pre_h = torch.where(m3, fresh_pre, pre_h)
+                        post_list = [torch.where(m2, fresh_p0, p) for p in post_list]
+                        hidden = (pre_h, post_list)
+
+                obs_t = obs_seq[:, t, :]
+                logits, vals, hidden = self.forward(obs_t, hidden)
+                # Do NOT detach within chunk — BPTT through chunk_size steps
+                chunk_logits.append(logits)
+                chunk_values.append(vals)
+
+            # Detach at chunk boundary only
+            hidden = self._detach_hidden(hidden)
+
+            cl = torch.stack(chunk_logits, dim=1).view(-1, self.action_dim)
+            cv = torch.stack(chunk_values, dim=1).view(-1)
+            dist = Categorical(logits=cl)
+            lp = dist.log_prob(actions_seq[:, chunk_start:chunk_end].reshape(-1))
+            ent = dist.entropy()
+
+            old_lp = old_log_probs[:, chunk_start:chunk_end].reshape(-1)
+            adv = advantages[:, chunk_start:chunk_end].reshape(-1)
+            ret = returns[:, chunk_start:chunk_end].reshape(-1)
+
+            log_ratio = (lp - old_lp).clamp(-3, 3)
+            ratio = torch.exp(log_ratio)
+            approx_kl = ((ratio.detach() - 1) - log_ratio.detach()).mean().item()
+            pg1 = ratio * adv
+            pg2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv
+            pg_loss = -torch.min(pg1, pg2).mean()
+            vf_loss = F.mse_loss(cv, ret)
+            ent_loss = -ent.mean()
+
+            chunk_loss = pg_loss + vf_coef * vf_loss + ent_coef * ent_loss
+            (chunk_loss * (chunk_end - chunk_start) / seq_len).backward()
+
+            pg_sum  += pg_loss.item() * (chunk_end - chunk_start)
+            vf_sum  += vf_loss.item() * (chunk_end - chunk_start)
+            ent_sum += ent_loss.item() * (chunk_end - chunk_start)
+            kl_sum  += approx_kl     * (chunk_end - chunk_start)
+
+        return {
+            "pg_loss":   pg_sum  / seq_len,
+            "vf_loss":   vf_sum  / seq_len,
+            "ent_loss":  ent_sum / seq_len,
+            "approx_kl": kl_sum  / seq_len,
+        }
 
     # ── Interpretability helpers ──────────────────────────────────────────────
 
