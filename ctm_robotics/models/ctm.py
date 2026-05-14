@@ -259,13 +259,11 @@ class CTMActorCritic(nn.Module):
     """
     Continuous Thought Machine Actor-Critic.
 
-    Interface matches LSTMActorCritic — drop-in replacement in the PPO trainer.
+    Wraps CTMCore with discrete actor + scalar critic heads on the sync repr.
+    Interface preserved for backwards compatibility with the home-grown PPO trainer.
 
     hidden_state = (pre_act_history, post_act_history_list)
-        pre_act_history:      (batch, D, M)  — FIFO pre-activation window
-        post_act_history_list: list of (batch, D) tensors, grows during episode
-
-    The post_act_history list is bounded at synch_window for memory efficiency.
+        See CTMCore for the contract.
     """
 
     def __init__(self, obs_dim: int, action_dim: int,
@@ -278,6 +276,8 @@ class CTMActorCritic(nn.Module):
                  n_ticks: int = 5,
                  input_hidden: int = 64):
         super().__init__()
+        from .ctm_core import CTMCore
+
         self.obs_dim     = obs_dim
         self.action_dim  = action_dim
         self.d_model     = d_model
@@ -285,30 +285,14 @@ class CTMActorCritic(nn.Module):
         self.n_ticks     = n_ticks
         self.synch_window = synch_window
 
-        # ── Observation backbone ──────────────────────────────────────────
-        self.backbone = nn.Sequential(
-            nn.Linear(obs_dim, input_hidden),
-            nn.GELU(),
-            nn.Linear(input_hidden, input_hidden),
+        self.core = CTMCore(
+            obs_dim=obs_dim, d_model=d_model,
+            synapse_hidden=synapse_hidden, synapse_depth=synapse_depth,
+            memory_length=memory_length, nlm_hidden=nlm_hidden, nlm_depth=nlm_depth,
+            n_synch_out=n_synch_out, synch_window=synch_window, synch_decay=synch_decay,
+            n_ticks=n_ticks, input_hidden=input_hidden,
         )
-        obs_embed_dim = input_hidden
 
-        # ── CTM core ─────────────────────────────────────────────────────
-        self.synapse = SynapseModel(d_model, obs_embed_dim,
-                                    synapse_hidden, synapse_depth)
-        self.nlms    = NeuronLevelModels(d_model, memory_length,
-                                          nlm_hidden, nlm_depth)
-        self.sync_head = SynchronizationHead(d_model, n_synch_out,
-                                              synch_window, synch_decay)
-
-        # ── Learned initial activated state (as in Sakana repo) ──────────
-        self.init_post_act = nn.Parameter(torch.randn(1, d_model) * 0.1)
-
-        # ── Normalize post-activations for stable sync products ────────────
-        self.post_norm = nn.LayerNorm(d_model)
-
-        # ── Actor / Critic heads read from synchronization ────────────────
-        # 2-layer MLPs matching Sakana's RL implementation (std=1 throughout)
         def _make_head(out_dim):
             m = nn.Sequential(
                 nn.Linear(n_synch_out, 64), nn.ReLU(),
@@ -324,98 +308,69 @@ class CTMActorCritic(nn.Module):
         self.actor_head  = _make_head(action_dim)
         self.critic_head = _make_head(1)
 
-        # ── Saliency storage (filled during forward, readable externally) ─
-        self.last_sync_repr    = None   # (batch, n_synch_out)
-        self.last_post_act_seq = None   # list of (batch, D) per tick
-
-    # ── Hidden state management ──────────────────────────────────────────────
+    # ── Expose core sub-modules for backward-compat (existing analysis scripts
+    # ──  e.g. run_interp_analysis.py reach into .backbone, .synapse, .nlms,
+    # ──  .post_norm, .sync_head, .init_post_act directly).
+    @property
+    def backbone(self):       return self.core.backbone
+    @property
+    def synapse(self):        return self.core.synapse
+    @property
+    def nlms(self):           return self.core.nlms
+    @property
+    def sync_head(self):      return self.core.sync_head
+    @property
+    def post_norm(self):      return self.core.post_norm
+    @property
+    def init_post_act(self):  return self.core.init_post_act
 
     def init_hidden(self, batch_size: int, device: torch.device):
-        """
-        Initialize hidden state at episode start.
-        pre_act_history: (batch, D, M) zeros
-        post_act_history: [initial_post_act]  — (batch, D)
-        """
-        pre_h = torch.zeros(batch_size, self.d_model, self.M, device=device)
-        # Initialize post_list with synch_window copies so episode resets in ppo_loss_chunked
-        # (which also produce synch_window copies) are consistent with collection.
-        post_0 = self.init_post_act.to(device).expand(batch_size, -1).detach().clone()
-        return (pre_h, [post_0] * self.synch_window)
+        return self.core.init_hidden(batch_size, device)
 
     def _detach_hidden(self, hidden_state):
-        """Detach hidden state from computation graph (between rollout chunks)."""
-        pre_h, post_list = hidden_state
-        return (pre_h.detach(),
-                [p.detach() for p in post_list])
-
-    # ── Core forward ─────────────────────────────────────────────────────────
+        return self.core.detach_hidden(hidden_state)
 
     def forward(self, obs, hidden_state):
-        """
-        Single environment step — runs T internal ticks.
-
-        Args:
-            obs:          (batch, obs_dim)
-            hidden_state: (pre_act_history, post_act_history_list)
-
-        Returns:
-            logits:        (batch, action_dim)
-            values:        (batch,)
-            new_hidden:    updated hidden state
-        """
-        pre_h, post_list = hidden_state
-        batch = obs.shape[0]
-        device = obs.device
-
-        # Encode observation (shared across all ticks)
-        obs_embed = self.backbone(obs)   # (batch, obs_embed_dim)
-
-        # Current post-activation (latest from history)
-        post_act = post_list[-1]        # (batch, D)
-
-        # Run T internal ticks
-        tick_post_acts = []
-        for tick in range(self.n_ticks):
-            # Synapse: combine current post-act + obs → pre-act
-            pre_act = self.synapse(post_act, obs_embed)   # (batch, D)
-
-            # Update pre-activation history (FIFO of length M)
-            pre_h = torch.cat([pre_h[..., 1:],           # drop oldest
-                                pre_act.unsqueeze(-1)],   # add newest
-                               dim=-1)                    # (batch, D, M)
-
-            # NLMs: each neuron processes its private history
-            post_act = self.post_norm(self.nlms(pre_h))   # (batch, D)
-            tick_post_acts.append(post_act)
-
-        # Update post-activation history (append all new ticks)
-        new_post_list = post_list + tick_post_acts
-        # Trim to synch_window to keep memory bounded
-        if len(new_post_list) > self.synch_window:
-            new_post_list = new_post_list[-self.synch_window:]
-
-        # Compute synchronization from history
-        sync_repr = self.sync_head(new_post_list)   # (batch, n_synch_out)
-
-        # Store for interpretability access
-        self.last_sync_repr    = sync_repr.detach()
-        self.last_post_act_seq = tick_post_acts
-
-        # Actor / Critic heads
-        logits = self.actor_head(sync_repr)            # (batch, action_dim)
-        values = self.critic_head(sync_repr).squeeze(-1)  # (batch,)
-
-        new_hidden = (pre_h, new_post_list)
+        sync_repr, new_hidden = self.core(obs, hidden_state)
+        logits = self.actor_head(sync_repr)
+        values = self.critic_head(sync_repr).squeeze(-1)
         return logits, values, new_hidden
 
-    # ── Action sampling ───────────────────────────────────────────────────────
-
     def get_action(self, obs, hidden_state):
-        """Sample action for one step."""
         logits, values, hidden_state = self.forward(obs, hidden_state)
         dist   = Categorical(logits=logits)
         action = dist.sample()
         return action, dist.log_prob(action), values, dist.entropy(), hidden_state
+
+    # ── State-dict translation: keep checkpoints saved before the refactor loadable.
+    # The old keys lived directly under the module (backbone.*, synapse.*, etc.);
+    # they now live under core.*. We translate transparently in both directions.
+
+    _CORE_SUBMODULE_PREFIXES = (
+        "backbone.", "synapse.", "nlms.", "sync_head.",
+        "post_norm.", "init_post_act",
+    )
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        sd = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
+        out = type(sd)()
+        core_prefix = f"{prefix}core."
+        for k, v in sd.items():
+            if k.startswith(core_prefix):
+                new_k = prefix + k[len(core_prefix):]
+                out[new_k] = v
+            else:
+                out[k] = v
+        return out
+
+    def load_state_dict(self, state_dict, strict=True):
+        translated = {}
+        for k, v in state_dict.items():
+            if any(k.startswith(s) for s in self._CORE_SUBMODULE_PREFIXES):
+                translated[f"core.{k}"] = v
+            else:
+                translated[k] = v
+        return super().load_state_dict(translated, strict=strict)
 
     # ── PPO evaluation (sequence mode) ───────────────────────────────────────
 
@@ -558,17 +513,7 @@ class CTMActorCritic(nn.Module):
     # ── Interpretability helpers ──────────────────────────────────────────────
 
     def get_sync_saliency(self):
-        """
-        Returns the last synchronization representation.
-        Shape: (batch, n_synch_out)
-        Can be mapped to observation variables via correlation analysis.
-        """
-        return self.last_sync_repr
+        return self.core.get_sync_saliency()
 
     def get_neural_dynamics(self):
-        """
-        Returns post-activation sequences from the last forward pass.
-        List of T tensors, each (batch, D).
-        Useful for visualizing how neurons evolve over internal ticks.
-        """
-        return self.last_post_act_seq
+        return self.core.get_neural_dynamics()
