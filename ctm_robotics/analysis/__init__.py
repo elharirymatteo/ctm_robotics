@@ -6,6 +6,7 @@ from .visualize import (
     plot_obs_saliency,
     plot_final_summary,
 )
+from . import decodability
 
 __all__ = [
     "plot_training_curves",
@@ -14,4 +15,5 @@ __all__ = [
     "plot_sync_matrix",
     "plot_obs_saliency",
     "plot_final_summary",
+    "decodability",
 ]
